@@ -1,154 +1,154 @@
+# dataset_DALE.py
+
 import os
+import numpy as np
+from PIL import Image
+import torch
 from torch.utils.data import Dataset
-import PIL.Image as Image
 from torchvision import transforms
 from data import dataset_utils as utils
-import numpy as np
-import torch
-# Class for train_lr
+
+# Shared tensor conversion
+_to_tensor = transforms.ToTensor()
+
 class DALETrain(Dataset):
-    def __init__(self, root_dir, args):
+    def __init__(self, root_dir, args, patch_size=240):
         """
-        Arguments:
-            1) root directory -> D:\data\LessNet\TRAIN\
-            2) arguments -> args
+        root_dir should contain two subfolders: 'SuperPixel' and 'GT'
+        args is passed to augmentation
         """
-        self.low_light_dir = root_dir + 'SuperPixel'
-        self.ground_truth_dir = root_dir + 'GT'
-        self.low_light_img_list = os.listdir(root_dir + 'SuperPixel')
-        self.ground_truth_img_list = os.listdir(root_dir + 'GT')
+        super().__init__()
+        self.low_light_dir = os.path.join(root_dir, 'SuperPixel')
+        self.ground_truth_dir = os.path.join(root_dir, 'GT')
 
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))
-        ])
+        self.low_light_img_list = sorted(os.listdir(self.low_light_dir))
+        self.ground_truth_img_list = sorted(os.listdir(self.ground_truth_dir))
 
-        self.transform2 = transforms.Compose([
-            transforms.ToTensor()
-        ])
+        assert len(self.low_light_img_list) == len(self.ground_truth_img_list), \
+            f"Mismatch: {len(self.low_light_img_list)} inputs vs {len(self.ground_truth_img_list)} GTs"
 
-        # patch_size : default == 128
         self.args = args
-        self.patch_size = 240
-
+        self.patch_size = patch_size
 
     def __len__(self):
         return len(self.low_light_img_list)
 
     def __getitem__(self, idx):
-        """
-        Get a random pair of image crops.
-        It returns a tuple of float tensors with shape [3, height, width].
-        They represent RGB images with pixel values in [0, 1] range.
-        :return: Low-light image, Ground-truth image tensor
-        """
-        low_light_name, ground_truth_name = self.low_light_img_list[idx], self.ground_truth_img_list[idx]
+        # Load & ensure RGB
+        low_name = self.low_light_img_list[idx]
+        gt_name  = self.ground_truth_img_list[idx]
+        low_img = Image.open(os.path.join(self.low_light_dir, low_name)).convert('RGB')
+        gt_img  = Image.open(os.path.join(self.ground_truth_dir, gt_name)).convert('RGB')
 
-        low_light_image = Image.open(os.path.join(self.low_light_dir, low_light_name))
-        ground_truth_image = Image.open(os.path.join(self.ground_truth_dir, ground_truth_name))
+        # Resize small images to patch_size
+        w, h = low_img.size
+        if w < self.patch_size or h < self.patch_size:
+            low_img = low_img.resize((self.patch_size, self.patch_size), Image.BICUBIC)
+            gt_img  = gt_img.resize((self.patch_size, self.patch_size), Image.BICUBIC)
 
-        # Get crop image
-        low_light_patch, ground_truth_patch = utils.get_patch_low_light(low_light_image, ground_truth_image, self.patch_size)
+        # Random crop patch
+        low_patch, gt_patch = utils.get_patch_low_light(low_img, gt_img, self.patch_size)
 
-        # Get augmented image
-        low_light_patch, ground_truth_patch = utils.augmentation_low_light(low_light_patch, ground_truth_patch, self.args)
-        # Get the image buffer as ndarray
+        # Augmentation
+        low_patch, gt_patch = utils.augmentation_low_light(low_patch, gt_patch, self.args)
 
-        buffer1 = np.asarray(low_light_patch).astype(np.long)
+        # Convert patches to NumPy arrays
+        buf1 = np.array(low_patch, dtype=np.uint8)
+        buf2 = np.array(gt_patch, dtype=np.uint8)
 
-        buffer2 = np.asarray(ground_truth_patch).astype(np.long)
+        # Drop alpha channel if present
+        if buf1.ndim == 3 and buf1.shape[2] == 4:
+            buf1 = buf1[..., :3]
+        if buf2.ndim == 3 and buf2.shape[2] == 4:
+            buf2 = buf2[..., :3]
 
-        # Subtract image2 from image1
+        # Expand grayscale to 3 channels
+        if buf1.ndim == 2:
+            buf1 = np.stack([buf1]*3, axis=2)
+        if buf2.ndim == 2:
+            buf2 = np.stack([buf2]*3, axis=2)
 
-        attention_patch = np.clip(buffer2 - buffer1, 0, 255).astype(np.uint8)
+        # Attention map: positive difference
+        att = np.clip(buf2.astype(np.int16) - buf1.astype(np.int16), 0, 255).astype(np.uint8)
 
-        # Convert to tensor
-        low_light_tensor = self.transform2(low_light_patch)
-        ground_truth_tensor = self.transform2(ground_truth_patch)
-        attention_tensor = self.transform2(attention_patch)
+        # Convert all to tensors [C, H, W], values in [0,1]
+        low_tensor = _to_tensor(buf1)
+        gt_tensor  = _to_tensor(buf2)
+        att_tensor = _to_tensor(att)
 
+        return low_tensor, gt_tensor, att_tensor, gt_name
 
-        return low_light_tensor, ground_truth_tensor, attention_tensor, ground_truth_name
 
 class DALETrainGlobal(Dataset):
-    def __init__(self, root_dir, args):
-        """
-        Arguments:
-            1) root directory -> D:\data\LessNet\TRAIN\
-            2) arguments -> args
-        """
-        self.low_light_dir = root_dir + 'SuperPixel'
-        self.ground_truth_dir = root_dir + 'GT'
-        self.low_light_img_list = os.listdir(root_dir + 'SuperPixel')
-        self.ground_truth_img_list = os.listdir(root_dir + 'GT')
+    def __init__(self, root_dir, args, patch_size=240):
+        super().__init__()
+        self.low_light_dir = os.path.join(root_dir, 'SuperPixel')
+        self.ground_truth_dir = os.path.join(root_dir, 'GT')
 
-        self.transform2 = transforms.Compose([
-            transforms.ToTensor()
-        ])
+        self.low_light_img_list = sorted(os.listdir(self.low_light_dir))
+        self.ground_truth_img_list = sorted(os.listdir(self.ground_truth_dir))
 
-        # patch_size : default == 128
+        assert len(self.low_light_img_list) == len(self.ground_truth_img_list), \
+            f"Mismatch: {len(self.low_light_img_list)} inputs vs {len(self.ground_truth_img_list)} GTs"
+
         self.args = args
-        self.patch_size = 240
-
+        self.patch_size = patch_size
 
     def __len__(self):
         return len(self.low_light_img_list)
 
     def __getitem__(self, idx):
+        low_name = self.low_light_img_list[idx]
+        gt_name  = self.ground_truth_img_list[idx]
+        low_img = Image.open(os.path.join(self.low_light_dir, low_name)).convert('RGB')
+        gt_img  = Image.open(os.path.join(self.ground_truth_dir, gt_name)).convert('RGB')
 
-        low_light_name, ground_truth_name = self.low_light_img_list[idx], self.ground_truth_img_list[idx]
+        # Resize small images
+        w, h = low_img.size
+        if w < self.patch_size or h < self.patch_size:
+            low_img = low_img.resize((self.patch_size, self.patch_size), Image.BICUBIC)
+            gt_img  = gt_img.resize((self.patch_size, self.patch_size), Image.BICUBIC)
 
-        low_light_image = Image.open(os.path.join(self.low_light_dir, low_light_name))
-        ground_truth_image = Image.open(os.path.join(self.ground_truth_dir, ground_truth_name))
+        # Global random crop
+        low_patch, gt_patch = utils.get_patch_low_light_global(low_img, gt_img, self.patch_size)
 
-        # Get crop image
-        low_light_patch, ground_truth_patch = utils.get_patch_low_light_global(low_light_image, ground_truth_image, self.patch_size)
+        # Augmentation
+        low_patch, gt_patch = utils.augmentation_low_light(low_patch, gt_patch, self.args)
 
-        # Get augmented image
-        low_light_patch, ground_truth_patch = utils.augmentation_low_light(low_light_patch, ground_truth_patch, self.args)
-        # Get the image buffer as ndarray
+        # Convert to NumPy and enforce 3 channels
+        buf1 = np.array(low_patch, dtype=np.uint8)
+        buf2 = np.array(gt_patch, dtype=np.uint8)
+        if buf1.ndim == 3 and buf1.shape[2] == 4:
+            buf1 = buf1[..., :3]
+        if buf2.ndim == 3 and buf2.shape[2] == 4:
+            buf2 = buf2[..., :3]
+        if buf1.ndim == 2:
+            buf1 = np.stack([buf1]*3, axis=2)
+        if buf2.ndim == 2:
+            buf2 = np.stack([buf2]*3, axis=2)
 
-        buffer1 = np.asarray(low_light_patch)
+        # Attention map
+        att = np.clip(buf2.astype(np.int16) - buf1.astype(np.int16), 0, 255).astype(np.uint8)
 
-        buffer2 = np.asarray(ground_truth_patch)
+        # To tensors
+        low_tensor = _to_tensor(buf1)
+        gt_tensor  = _to_tensor(buf2)
+        att_tensor = _to_tensor(att)
 
-        # Subtract image2 from image1
+        return low_tensor, gt_tensor, att_tensor, gt_name
 
-        attention_patch = buffer2 - buffer1
 
-        # Convert to tensor
-        low_light_tensor = self.transform2(low_light_patch)
-        ground_truth_tensor = self.transform2(ground_truth_patch)
-        attention_tensor = self.transform2(attention_patch)
-
-        return low_light_tensor, ground_truth_tensor, attention_tensor, ground_truth_name
-
-# Class for test
 class DALETest(Dataset):
     def __init__(self, root_dir):
-        """
-        Arguments:
-            1) root directory -> D:\data\LessNet\TEST\
-            2) arguments -> args
-        """
+        super().__init__()
         self.root_dir = root_dir
-        self.test_img_list = os.listdir(root_dir)
-        self.transform = transforms.Compose([
-            transforms.ToTensor(),
-        ])
+        self.test_img_list = sorted(os.listdir(root_dir))
 
     def __len__(self):
         return len(self.test_img_list)
 
     def __getitem__(self, idx):
-        """
-        Get a test image tensor.
-        It returns a tuple of float tensors with shape [3, height, width].
-        They represent RGB images with pixel values in [0, 1] range.
-        :return: test image tensor, file name
-        """
-        test_img_name = self.test_img_list[idx]
-        # Open Image
-        test_image = Image.open(os.path.join(self.root_dir, test_img_name))
-        test_image_tensor = self.transform(test_image)
-        return test_image_tensor, test_img_name
+        name = self.test_img_list[idx]
+        img  = Image.open(os.path.join(self.root_dir, name)).convert('RGB')
+        tensor = _to_tensor(img)
+        return tensor, name
